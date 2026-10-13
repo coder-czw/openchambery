@@ -15,6 +15,7 @@ import {
   type SessionIndexSnapshot,
 } from '@/lib/session-index-api';
 import { normalizePath } from '@/lib/pathNormalization';
+import { loadDirectoryAliases, resolveAliasedDirectory } from '@/lib/opencode/directory-aliases';
 import { getRuntimeGeneration, getRuntimeKey, getRuntimeTransportIdentity } from '@/lib/runtime-switch';
 import {
   refreshSessionIndexSnapshotQuery,
@@ -83,6 +84,12 @@ type GlobalSessionsState = {
   /** Blocking session-index cold-start refresh progress for persisted directories. */
   startupSyncProgress: StartupSessionSyncProgress;
   loadSessions: (fallbackActive?: Session[]) => Promise<LoadResult>;
+  /**
+   * Pull the server's directory alias map (symlinked spellings → canonical
+   * realpath) and rebuild directory-keyed caches when it changed. Live
+   * sessions keep their raw spelling; resolution happens at read time.
+   */
+  refreshDirectoryAliases: () => Promise<void>;
   refreshSessionsForDirectories: (
     directories: Iterable<string>,
     fallbackActive?: Session[],
@@ -249,8 +256,8 @@ export const resolveGlobalSessionDirectory = (session: Session): string | null =
     project?: { worktree?: string | null } | null;
   };
 
-  return normalizePath(record.directory ?? null)
-    ?? normalizePath(record.project?.worktree ?? null);
+  return resolveAliasedDirectory(normalizePath(record.directory ?? null))
+    ?? resolveAliasedDirectory(normalizePath(record.project?.worktree ?? null));
 };
 
 export const mergeSessionDirectoryMetadata = (incoming: Session, existing?: Session | null): Session => {
@@ -1412,7 +1419,20 @@ export const useGlobalSessionsStore = create<GlobalSessionsState>((set, get) => 
     return { activeSessions: get().activeSessions, archivedSessions: get().archivedSessions };
   },
 
+  refreshDirectoryAliases: async () => {
+    try {
+      const changed = await loadDirectoryAliases();
+      if (!changed) return;
+      set((state) => ({
+        sessionsByDirectory: buildSessionsByDirectory(state.activeSessions),
+      }));
+    } catch {
+      // Advisory only — raw spellings keep working when the map is unavailable.
+    }
+  },
+
   loadSessions: async (fallbackActive) => {
+    void get().refreshDirectoryAliases();
     if (inflightLoad) {
       return inflightLoad;
     }

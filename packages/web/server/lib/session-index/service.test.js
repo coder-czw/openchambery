@@ -611,3 +611,67 @@ describe('Electron session index', () => {
     service.close();
   });
 });
+
+describe('directory alias canonicalization', () => {
+  const ALIAS_RUNTIME = { value: 'http://runtime-alias.test' };
+
+  const makeAliasService = (dbPath, canonicalizeDirectory) => createSessionIndexService({
+    dbPath,
+    getRuntimeConfig: () => ({ apiBaseUrl: ALIAS_RUNTIME.value }),
+    ...(canonicalizeDirectory ? { canonicalizeDirectory } : {}),
+  });
+
+  const makeTempDbPath = () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'openchamber-session-index-'));
+    tempDirectories.push(directory);
+    return path.join(directory, 'session-index.sqlite');
+  };
+
+  it('stores alias-spelled sessions under the canonical directory and reports the alias', () => {
+    const service = makeAliasService(makeTempDbPath(), (value) => (value === '/alias/repo' ? '/real/repo' : value));
+
+    service.replaceDirectory({ directory: '/real/repo', sessions: [session('ses_a', 100, '/alias/repo')], now: 500 });
+    service.upsert(session('ses_b', 200, '/alias/repo'), 600);
+
+    const snapshot = service.snapshot();
+    expect(snapshot.directories.map((row) => row.directory)).toEqual(['/real/repo']);
+    expect(snapshot.directories[0].sessions.map((row) => row.id).sort()).toEqual(['ses_a', 'ses_b']);
+    expect(service.getDirectoryAliases()).toEqual({ '/alias/repo': '/real/repo' });
+    service.close();
+  });
+
+  it('migrates alias-spelled rows recorded before canonicalization on reopen', () => {
+    const dbPath = makeTempDbPath();
+    const before = makeAliasService(dbPath);
+    before.replaceDirectory({ directory: '/alias/repo', sessions: [session('ses_old', 100, '/alias/repo')], cursor: 40, hasMore: false, now: 500 });
+    before.close();
+
+    const after = makeAliasService(dbPath, (value) => (value === '/alias/repo' ? '/real/repo' : value));
+    const snapshot = after.snapshot();
+    expect(snapshot.directories.map((row) => row.directory)).toEqual(['/real/repo']);
+    expect(snapshot.directories[0].sessions.map((row) => row.id)).toEqual(['ses_old']);
+    expect(after.getDirectoryAliases()).toEqual({ '/alias/repo': '/real/repo' });
+    after.close();
+  });
+
+  it('merges an alias directory into an existing canonical directory row on reopen', () => {
+    const dbPath = makeTempDbPath();
+    const before = makeAliasService(dbPath, (value) => (value === '/alias/repo' ? '/real/repo' : value));
+    before.replaceDirectory({ directory: '/real/repo', sessions: [session('ses_real', 300, '/real/repo')], now: 500 });
+    // Write alias-spelled rows directly, bypassing canonicalization.
+    const raw = createRequire(import.meta.url)('better-sqlite3');
+    const db = new raw(dbPath);
+    db.prepare(`INSERT INTO runtime_directory(runtime_key, directory, cursor, has_more, last_synced_at, last_full_synced_at, last_accessed_at)
+      VALUES ('${before.getRuntimeKey()}', '/alias/repo', 10, 0, 100, 100, 100)`).run();
+    db.prepare(`INSERT INTO session_summary(runtime_key, directory, session_id, title, created_at, updated_at, activity_updated_at, archived_at)
+      VALUES ('${before.getRuntimeKey()}', '/alias/repo', 'ses_alias', 'Alias', 90, 90, 90, 0)`).run();
+    db.close();
+    before.close();
+
+    const after = makeAliasService(dbPath, (value) => (value === '/alias/repo' ? '/real/repo' : value));
+    const snapshot = after.snapshot();
+    expect(snapshot.directories.map((row) => row.directory)).toEqual(['/real/repo']);
+    expect(snapshot.directories[0].sessions.map((row) => row.id).sort()).toEqual(['ses_alias', 'ses_real']);
+    after.close();
+  });
+});

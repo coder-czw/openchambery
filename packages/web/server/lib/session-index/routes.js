@@ -58,6 +58,16 @@ export const registerSessionIndexRoutes = (app, {
     res.status(202).json(sessionIndexSyncRuntime.enqueue(directories));
   });
 
+  // Alias → canonical directory map. OpenCode stores sessions under the raw
+  // directory spelling the launching client used (symlinked ancestors collapse
+  // onto the realpath only here); the renderer normalizes live sessions with it.
+  app.get('/api/openchamber/directory-aliases', (_req, res) => {
+    if (!sessionIndexService || typeof sessionIndexService.getDirectoryAliases !== 'function') {
+      return unsupported(res);
+    }
+    return res.json({ available: true, aliases: sessionIndexService.getDirectoryAliases() });
+  });
+
   app.put('/api/openchamber/session-index/directory', (req, res) => {
     if (!sessionIndexService) return unsupported(res);
     try {

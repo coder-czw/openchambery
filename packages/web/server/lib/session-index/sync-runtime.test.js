@@ -96,8 +96,10 @@ describe('session index background sync runtime', () => {
     await waitUntil(() => isFullyIdle(runtime));
 
     expect(maxActive).toBe(1);
-    expect(fetchFn).toHaveBeenCalledTimes(4);
-    expect(fetchFn.mock.calls[0][0].pathname).toBe('/session');
+    // One project-list fetch (cached) precedes the two directory + two child reads.
+    expect(fetchFn).toHaveBeenCalledTimes(5);
+    expect(fetchFn.mock.calls[0][0].pathname).toBe('/project');
+    expect(fetchFn.mock.calls[1][0].pathname).toBe('/session');
     expect(service.replaceDirectory).toHaveBeenCalledTimes(2);
     expect(service.replaceChildSessions).toHaveBeenCalledTimes(2);
     expect(runtime.snapshot().sync).toMatchObject({ completed: 2, total: 2, failedDirectories: [] });
@@ -328,7 +330,7 @@ describe('session index background sync runtime', () => {
     runtime.noteInteractiveRequest();
     await waitUntil(() => isFullyIdle(runtime));
 
-    expect(calls).toBe(2);
+    expect(calls).toBe(3);
     expect(runtime.snapshot().sync.completed).toBe(1);
   });
 
@@ -348,7 +350,7 @@ describe('session index background sync runtime', () => {
     runtime.enqueue(['/repo']);
     await waitUntil(() => isFullyIdle(runtime));
 
-    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(fetchFn).toHaveBeenCalledTimes(3);
   });
 
   it('marks in-flight and queued directories failed when the runtime stops', async () => {
@@ -440,5 +442,76 @@ describe('session index background sync runtime', () => {
     expect(runtime.snapshot().directories).toEqual([
       expect.objectContaining({ directory: '/repo', sessions: [] }),
     ]);
+  });
+});
+
+describe('project-scoped alias syncing', () => {
+  it('lists by project so symlink-aliased sessions land under the canonical directory', async () => {
+    const service = createService();
+    const sessionParams = [];
+    const aliasRow = (id, updated, locationDirectory) => ({
+      id,
+      title: id,
+      location: { directory: locationDirectory },
+      time: { created: updated - 1, updated },
+    });
+    const runtime = createSessionIndexSyncRuntime({
+      sessionIndexService: service,
+      buildOpenCodeUrl: (route) => `http://opencode.test${route}`,
+      getOpenCodeAuthHeaders: () => ({}),
+      waitForOpenCodeReady: async () => true,
+      canonicalizeDirectory: (value) => (value === '/home/dev/work/repo' ? '/orico/work/repo' : value),
+      fetchFn: vi.fn(async (url) => {
+        if (url.pathname === '/project') {
+          return new Response(JSON.stringify([{ id: 'proj_1', canonical: '/orico/work/repo' }]));
+        }
+        sessionParams.push({ project: url.searchParams.get('project'), directory: url.searchParams.get('directory') });
+        return new Response(JSON.stringify({
+          data: [
+            session('ses_real', 300, '/orico/work/repo'),
+            aliasRow('ses_alias', 200, '/home/dev/work/repo'),
+            aliasRow('ses_other', 250, '/orico/work/other'),
+          ],
+          cursor: null,
+        }));
+      }),
+    });
+
+    runtime.enqueue(['/orico/work/repo']);
+    await waitUntil(() => isFullyIdle(runtime));
+
+    expect(sessionParams.length).toBeGreaterThan(0);
+    expect(sessionParams[0]).toEqual({ project: 'proj_1', directory: null });
+    expect(sessionParams.every((params) => params.project === 'proj_1')).toBe(true);
+    const replace = service.replaceDirectory.mock.calls[0][0];
+    expect(replace.directory).toBe('/orico/work/repo');
+    expect(replace.sessions.map((row) => row.id).sort()).toEqual(['ses_alias', 'ses_real']);
+    runtime.stop();
+  });
+
+  it('falls back to directory-scoped queries when the project list is unavailable', async () => {
+    const service = createService();
+    const sessionParams = [];
+    const runtime = createSessionIndexSyncRuntime({
+      sessionIndexService: service,
+      buildOpenCodeUrl: (route) => `http://opencode.test${route}`,
+      getOpenCodeAuthHeaders: () => ({}),
+      waitForOpenCodeReady: async () => true,
+      fetchFn: vi.fn(async (url) => {
+        if (url.pathname === '/project') {
+          return new Response('upstream unavailable', { status: 502 });
+        }
+        sessionParams.push({ project: url.searchParams.get('project'), directory: url.searchParams.get('directory') });
+        return new Response(JSON.stringify({ data: [session('ses_a', 100)], cursor: null }));
+      }),
+    });
+
+    runtime.enqueue(['/repo']);
+    await waitUntil(() => isFullyIdle(runtime));
+
+    expect(sessionParams.length).toBeGreaterThan(0);
+    expect(sessionParams.every((params) => params.project === null && params.directory === '/repo')).toBe(true);
+    expect(service.replaceDirectory.mock.calls[0][0].sessions.map((row) => row.id)).toEqual(['ses_a']);
+    runtime.stop();
   });
 });

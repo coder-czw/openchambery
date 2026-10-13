@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 
+import { createDirectoryAliasResolver } from './directory-aliases.js';
+
 const require = createRequire(import.meta.url);
 
 const SCHEMA_VERSION = 6;
@@ -55,10 +57,10 @@ const runtimeKeyFor = (runtimeConfig) => {
   return crypto.createHash('sha256').update(source).digest('hex');
 };
 
-const toSummary = (session, fallbackDirectory) => {
+const toSummary = (session, fallbackDirectory, canonicalize = (value) => value) => {
   if (!session || !isVisibleSession(session) || typeof session.id !== 'string' || !session.id) return null;
-  const directory = normalizeDirectory(session.directory ?? session.project?.worktree ?? fallbackDirectory);
-  if (!directory) return null;
+  const directory = canonicalize(normalizeDirectory(session.directory ?? session.project?.worktree ?? fallbackDirectory));
+  if (!directory || typeof directory !== 'string') return null;
   const openchamber = session.metadata?.openchamber;
   const assistant = openchamber?.assistant;
   const hideAssistantMarker = isContactAssignedSession(openchamber);
@@ -77,7 +79,7 @@ const toSummary = (session, fallbackDirectory) => {
   };
 };
 
-export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => null } = {}) => {
+export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => null, canonicalizeDirectory } = {}) => {
   if (typeof dbPath !== 'string' || !dbPath.trim()) return null;
 
   const Database = require('better-sqlite3');
@@ -155,6 +157,12 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
       pinned_at INTEGER NOT NULL,
       PRIMARY KEY (runtime_key, session_id)
     );
+    CREATE TABLE IF NOT EXISTS directory_alias (
+      runtime_key TEXT NOT NULL,
+      alias TEXT NOT NULL,
+      canonical TEXT NOT NULL,
+      PRIMARY KEY (runtime_key, alias)
+    );
   `);
   const sessionSummaryColumns = new Set(
     db.prepare("SELECT name FROM pragma_table_info('session_summary')").all().map((column) => column.name),
@@ -187,6 +195,91 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
   })();
 
   const runtimeKey = () => runtimeKeyFor(getRuntimeConfig());
+  const canonicalize = typeof canonicalizeDirectory === 'function'
+    ? canonicalizeDirectory
+    : createDirectoryAliasResolver().canonicalizeDirectory;
+  const canonicalDirectory = (value) => {
+    const normalized = normalizeDirectory(value);
+    if (!normalized) return null;
+    const canonical = canonicalize(normalized);
+    return typeof canonical === 'string' && canonical.trim() ? canonical : normalized;
+  };
+
+  // Alias pairs power the renderer-side normalization of live sessions; the
+  // raw spelling is recorded before it collapses onto the canonical form.
+  const insertAlias = db.prepare(
+    'INSERT OR IGNORE INTO directory_alias(runtime_key, alias, canonical) VALUES (?, ?, ?)',
+  );
+  const notedAliases = new Set();
+  const noteDirectoryAlias = (value) => {
+    const normalized = normalizeDirectory(value);
+    if (!normalized) return null;
+    const canonical = canonicalDirectory(normalized);
+    if (canonical !== normalized && !notedAliases.has(normalized)) {
+      notedAliases.add(normalized);
+      try {
+        insertAlias.run(runtimeKey(), normalized, canonical);
+      } catch {
+        // Recording an alias is advisory only.
+      }
+    }
+    return canonical;
+  };
+
+  // Collapse alias-spelled directories (e.g. symlinked ancestors) recorded by
+  // earlier versions onto their canonical form so they group with the sessions
+  // OpenCode stores under the real path. Runs once per open, current runtime only.
+  const migrateDirectoryAliases = () => {
+    const key = runtimeKey();
+    const merges = [];
+    for (const row of db.prepare('SELECT directory FROM runtime_directory WHERE runtime_key = ?').all(key)) {
+      const canonical = canonicalDirectory(row.directory);
+      if (canonical && canonical !== row.directory) {
+        notedAliases.add(row.directory);
+        merges.push({ stored: row.directory, canonical });
+      }
+    }
+    if (merges.length === 0) return;
+    db.transaction(() => {
+      // Parent keys and child rows repoint within one transaction; deferring
+      // the FK check to COMMIT sidesteps the ordering constraint.
+      db.pragma('defer_foreign_keys = ON');
+      for (const { stored, canonical } of merges) {
+        insertAlias.run(key, stored, canonical);
+        // Repoint child rows before touching the parent: the parent's ON
+        // DELETE CASCADE would otherwise drop rows still under `stored`.
+        db.prepare('UPDATE OR REPLACE session_summary SET directory = ? WHERE runtime_key = ? AND directory = ?').run(canonical, key, stored);
+        db.prepare('UPDATE OR REPLACE session_child SET directory = ? WHERE runtime_key = ? AND directory = ?').run(canonical, key, stored);
+        const existing = db.prepare(
+          'SELECT cursor, has_more, last_synced_at, last_full_synced_at, last_accessed_at FROM runtime_directory WHERE runtime_key = ? AND directory = ?',
+        ).get(key, canonical);
+        if (existing) {
+          const source = db.prepare(
+            'SELECT cursor, has_more, last_synced_at, last_full_synced_at, last_accessed_at FROM runtime_directory WHERE runtime_key = ? AND directory = ?',
+          ).get(key, stored);
+          db.prepare(`UPDATE runtime_directory SET
+            cursor = MAX(COALESCE(cursor, 0), COALESCE(?, 0)),
+            has_more = MAX(has_more, ?),
+            last_synced_at = MAX(last_synced_at, ?),
+            last_full_synced_at = MAX(last_full_synced_at, ?),
+            last_accessed_at = MAX(last_accessed_at, ?)
+            WHERE runtime_key = ? AND directory = ?`).run(
+            source?.cursor ?? null,
+            source?.has_more ?? 0,
+            source?.last_synced_at ?? 0,
+            source?.last_full_synced_at ?? 0,
+            source?.last_accessed_at ?? 0,
+            key,
+            canonical,
+          );
+          db.prepare('DELETE FROM runtime_directory WHERE runtime_key = ? AND directory = ?').run(key, stored);
+        } else {
+          db.prepare('UPDATE runtime_directory SET directory = ? WHERE runtime_key = ? AND directory = ?').run(canonical, key, stored);
+        }
+      }
+    })();
+  };
+  migrateDirectoryAliases();
   const touchDirectory = db.prepare(`
     INSERT INTO runtime_directory(runtime_key, directory, cursor, has_more, last_synced_at, last_full_synced_at, last_accessed_at)
     VALUES (@runtimeKey, @directory, @cursor, @hasMore, @lastSyncedAt, @lastFullSyncedAt, @lastAccessedAt)
@@ -300,7 +393,7 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
     return moved && moved.directory !== normalizeDirectory(directory) && toTimestamp(session?.time?.updated) <= moved.at;
   };
   const move = db.transaction((sessionID, directory, at = Date.now(), sequence) => {
-    directory = normalizeDirectory(directory);
+    directory = noteDirectoryAlias(directory);
     if (!sessionID || !directory) return false;
     const key = runtimeKey();
     const fenceKey = `${key}:${sessionID}`;
@@ -319,7 +412,7 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
   });
 
   const replaceDirectoryRows = ({ directory, sessions, cursor, hasMore, fullSync = true, now = Date.now() }) => {
-    const normalizedDirectory = normalizeDirectory(directory);
+    const normalizedDirectory = noteDirectoryAlias(directory);
     if (!normalizedDirectory) throw new Error('directory is required');
     const key = runtimeKey();
     const previousStateByID = new Map(
@@ -331,7 +424,7 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
     const summaries = Array.isArray(sessions)
       ? sessions
         .filter((session) => !isStaleLocation(session, normalizedDirectory))
-        .map((session) => toSummary(session, normalizedDirectory))
+        .map((session) => toSummary(session, normalizedDirectory, canonicalDirectory))
         .filter((summary) => summary && !summary.archivedAt)
         .slice(0, MAX_ROOT_SESSIONS)
       : [];
@@ -375,7 +468,8 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
       const changed = remove(session?.id);
       return { accepted: changed, changed };
     }
-    const summary = toSummary(session);
+    noteDirectoryAlias(session?.directory ?? session?.location?.directory ?? session?.project?.worktree);
+    const summary = toSummary(session, undefined, canonicalDirectory);
     if (!summary) return { accepted: false, changed: false };
     const key = runtimeKey();
     if (summary.archivedAt) {
@@ -609,7 +703,7 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
   };
 
   const replaceChildSessions = db.transaction((directory, parentSessionID, children) => {
-    const normalizedDirectory = normalizeDirectory(directory);
+    const normalizedDirectory = noteDirectoryAlias(directory);
     if (!normalizedDirectory || typeof parentSessionID !== 'string' || !parentSessionID) return false;
     const key = runtimeKey();
     const childIDs = Array.isArray(children)
@@ -622,6 +716,22 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
     const result = setHasChildren.run(toBooleanInt(childIDs.length > 0), key, normalizedDirectory, parentSessionID);
     return result.changes > 0;
   });
+
+  /** Alias → canonical directory map for the current runtime (renderer live-path normalization). */
+  const getDirectoryAliases = () => {
+    const key = runtimeKey();
+    const aliases = {};
+    for (const row of db.prepare('SELECT alias, canonical FROM directory_alias WHERE runtime_key = ?').all(key)) {
+      aliases[row.alias] = row.canonical;
+    }
+    for (const row of db.prepare('SELECT DISTINCT directory FROM runtime_directory WHERE runtime_key = ?').all(key)) {
+      const canonical = canonicalDirectory(row.directory);
+      if (canonical && canonical !== row.directory && !(row.directory in aliases)) {
+        aliases[row.directory] = canonical;
+      }
+    }
+    return aliases;
+  };
 
   return {
     replaceDirectory,
@@ -638,6 +748,7 @@ export const createSessionIndexService = ({ dbPath, getRuntimeConfig = () => nul
     findBySessionId,
     replaceChildSessions,
     snapshot,
+    getDirectoryAliases,
     getRuntimeKey: runtimeKey,
     close: () => db.close(),
   };

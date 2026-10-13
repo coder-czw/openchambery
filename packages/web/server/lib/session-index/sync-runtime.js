@@ -1,4 +1,5 @@
 import { isVisibleSession } from './service.js';
+import { canonicalizeDirectory as defaultCanonicalizeDirectory } from './directory-aliases.js';
 
 const SESSION_LIMIT = 20;
 /** Max upstream list pages while skipping consecutive Host-archived rows. */
@@ -7,6 +8,9 @@ const FULL_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 6_000;
 const INTERACTIVE_YIELD_MS = 1_000;
 const LONG_POLL_MAX_MS = 25_000;
+/** OpenCode resolves sessions to projects across directory spellings (symlinked
+ * ancestors included), so the directory → project map is refreshed at this cadence. */
+const PROJECT_INDEX_TTL_MS = 60_000;
 
 const normalizeDirectory = (value) => {
   if (typeof value !== 'string') return null;
@@ -76,8 +80,11 @@ export const createSessionIndexSyncRuntime = ({
   now = Date.now,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
+  canonicalizeDirectory = defaultCanonicalizeDirectory,
 } = {}) => {
   if (!sessionIndexService) return null;
+
+  const canonicalDirectoryOf = (value) => canonicalizeDirectory(value) ?? normalizeDirectory(value);
 
   let revision = 0;
   let stopped = false;
@@ -87,6 +94,8 @@ export const createSessionIndexSyncRuntime = ({
   let currentWasPreempted = false;
   let interactiveUntil = 0;
   let runtimeKey = sessionIndexService.getRuntimeKey();
+  let projectDirectoryIndex = null;
+  let projectDirectoryIndexAt = 0;
   const queue = [];
   const childFlagQueue = [];
   const queuedDirectories = new Set();
@@ -152,6 +161,46 @@ export const createSessionIndexSyncRuntime = ({
   const readDirectory = (directory) => sessionIndexService.snapshot().directories
     .find((entry) => entry.directory === directory);
 
+  const loadProjectDirectoryIndex = async (signal) => {
+    const url = new URL(buildOpenCodeUrl('/project'));
+    const response = await fetchFn(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(`OpenCode project list failed (${response.status})`);
+    }
+    const payload = await response.json();
+    const projects = Array.isArray(payload) ? payload : payload?.data;
+    if (!Array.isArray(projects)) throw new Error('Invalid OpenCode project list payload');
+    const index = new Map();
+    for (const project of projects) {
+      if (typeof project?.id !== 'string' || !project.id) continue;
+      const canonical = canonicalDirectoryOf(project.canonical);
+      if (canonical && !index.has(canonical)) index.set(canonical, project.id);
+    }
+    return index;
+  };
+
+  /**
+   * OpenCode buckets sessions into projects across directory spellings, so a
+   * project-scoped list also returns sessions stored under symlinked aliases
+   * of the requested directory. Failures fall back to directory-scoped lists.
+   */
+  const projectIDForDirectory = async (canonicalTaskDirectory, signal) => {
+    if (!projectDirectoryIndex || now() - projectDirectoryIndexAt > PROJECT_INDEX_TTL_MS) {
+      try {
+        projectDirectoryIndex = await loadProjectDirectoryIndex(signal);
+        projectDirectoryIndexAt = now();
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        projectDirectoryIndex = null;
+      }
+    }
+    return projectDirectoryIndex?.get(canonicalTaskDirectory) ?? null;
+  };
+
   const fetchDirectory = async (task) => {
     // v2 `session.list` cursor pagination. Collect candidates across pages,
     // then re-project once before commit so a Host archive that lands mid-sync
@@ -162,6 +211,8 @@ export const createSessionIndexSyncRuntime = ({
     currentWasPreempted = false;
     const timeout = setTimer(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
+      const canonicalTaskDirectory = canonicalDirectoryOf(task.directory);
+      const projectID = await projectIDForDirectory(canonicalTaskDirectory, controller.signal);
       /** @type {object[]} raw upstream sessions collected across pages */
       const collected = [];
       let pages = 0;
@@ -173,7 +224,8 @@ export const createSessionIndexSyncRuntime = ({
 
       while (collected.length < SESSION_LIMIT * 3 && pages < ARCHIVE_SKIP_PAGE_BUDGET) {
         const url = new URL(buildOpenCodeUrl('/session'));
-        url.searchParams.set('directory', task.directory);
+        if (projectID) url.searchParams.set('project', projectID);
+        else url.searchParams.set('directory', task.directory);
         url.searchParams.set('limit', String(SESSION_LIMIT));
         if (cursorToken) {
           url.searchParams.set('cursor', cursorToken);
@@ -195,7 +247,15 @@ export const createSessionIndexSyncRuntime = ({
         pages += 1;
 
         for (const session of sessions) {
-          if (session?.id) collected.push(session);
+          if (!session?.id) continue;
+          // Project-scoped rows carry the raw spelling in `location.directory`;
+          // normalize onto the canonical form so summaries bucket correctly.
+          const rawDirectory = session.location?.directory ?? session.directory;
+          const resolvedDirectory = rawDirectory ? canonicalizeDirectory(rawDirectory) : null;
+          if (resolvedDirectory && resolvedDirectory !== session.directory) {
+            session.directory = resolvedDirectory;
+          }
+          collected.push(session);
         }
 
         // v2: exhaust by cursor.next when present. A short page with next is
@@ -251,9 +311,15 @@ export const createSessionIndexSyncRuntime = ({
         }
       }
 
-      // Root + system filters before filling the active-20 capacity.
+      // Root + system filters before filling the active-20 capacity. A project
+      // may span sibling directories (worktrees); keep only this directory's
+      // bucket — the other spellings get their own sync tasks.
       const active = [];
       for (const session of projected) {
+        if (projectID) {
+          const bucket = canonicalizeDirectory(session.location?.directory ?? session.directory) ?? canonicalTaskDirectory;
+          if (bucket !== canonicalTaskDirectory) continue;
+        }
         if (!isRootActiveCandidate(session)) continue;
         if (active.length >= SESSION_LIMIT) break;
         active.push(session);
@@ -264,7 +330,7 @@ export const createSessionIndexSyncRuntime = ({
         ? Number(lastCursorToken)
         : (updatedAt(oldest) || null);
       sessionIndexService.replaceDirectory({
-        directory: task.directory,
+        directory: canonicalTaskDirectory,
         sessions: active,
         cursor: cursorNumber,
         hasMore: upstreamHasMore || hitPageBudget || active.length === SESSION_LIMIT,
@@ -273,10 +339,10 @@ export const createSessionIndexSyncRuntime = ({
       });
       for (const session of active) {
         if (!session?.id) continue;
-        const key = `${task.runtimeKey}\n${task.directory}\n${session.id}`;
+        const key = `${task.runtimeKey}\n${canonicalTaskDirectory}\n${session.id}`;
         if (queuedChildFlagKeys.has(key)) continue;
         queuedChildFlagKeys.add(key);
-        childFlagQueue.push({ directory: task.directory, sessionID: session.id, runtimeKey: task.runtimeKey, key });
+        childFlagQueue.push({ directory: canonicalTaskDirectory, sessionID: session.id, runtimeKey: task.runtimeKey, projectID, key });
       }
       return 'completed';
     } catch (error) {
@@ -300,7 +366,8 @@ export const createSessionIndexSyncRuntime = ({
       // `parentID` filter on the session list (`GET /api/session`).
       const url = new URL(buildOpenCodeUrl('/session'));
       url.searchParams.set('parentID', task.sessionID);
-      url.searchParams.set('directory', task.directory);
+      if (task.projectID) url.searchParams.set('project', task.projectID);
+      else url.searchParams.set('directory', task.directory);
       const response = await fetchFn(url, {
         method: 'GET',
         headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },

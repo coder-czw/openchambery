@@ -22,6 +22,7 @@ import { sessionEvents } from '@/lib/sessionEvents';
 import { getDeferredSafeStorage } from '@/stores/utils/safeStorage';
 import { createInstanceScopedStorageAdapter } from '@/lib/instanceScopedStorage';
 import { isRuntimeInstanceChange, subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
+import { resolveAliasedDirectory } from '@/lib/opencode/directory-aliases';
 import { useGitRepoStatusMap } from '@/stores/useGitStore';
 import { isVSCodeRuntime } from '@/lib/desktop';
 import { forceRefreshProjectWorktreeCatalog } from '@/lib/worktrees/worktreeManager';
@@ -217,7 +218,7 @@ const buildKnownSessionDirectories = (
 ): Set<string> => {
   const directories = new Set<string>();
   for (const project of projects) {
-    const normalized = normalizePath(project.path)?.toLowerCase();
+    const normalized = resolveAliasedDirectory(normalizePath(project.path))?.toLowerCase();
     if (normalized) directories.add(normalized);
   }
   if (options?.includeWorktrees === false) {
@@ -225,7 +226,7 @@ const buildKnownSessionDirectories = (
   }
   for (const worktrees of availableWorktreesByProject.values()) {
     for (const worktree of worktrees) {
-      const normalized = normalizePath(worktree.path)?.toLowerCase();
+      const normalized = resolveAliasedDirectory(normalizePath(worktree.path))?.toLowerCase();
       if (normalized) directories.add(normalized);
     }
   }

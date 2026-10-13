@@ -214,3 +214,31 @@ describe('session index routes', () => {
     expect(publishChange).not.toHaveBeenCalled();
   });
 });
+
+describe('directory alias routes', () => {
+  it('serves the alias map for the current runtime', () => {
+    const { app, route } = registry();
+    registerSessionIndexRoutes(app, {
+      sessionIndexService: {
+        snapshot: () => ({ directories: [] }),
+        getDirectoryAliases: () => ({ '/alias/repo': '/real/repo' }),
+      },
+    });
+    const res = response();
+
+    route('GET', '/api/openchamber/directory-aliases')({}, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ available: true, aliases: { '/alias/repo': '/real/repo' } });
+  });
+
+  it('returns unsupported when the service cannot report aliases', () => {
+    const { app, route } = registry();
+    registerSessionIndexRoutes(app, { sessionIndexService: { snapshot: () => ({ directories: [] }) } });
+    const res = response();
+
+    route('GET', '/api/openchamber/directory-aliases')({}, res);
+
+    expect(res.statusCode).toBe(501);
+  });
+});
